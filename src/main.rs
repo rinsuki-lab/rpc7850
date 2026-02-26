@@ -33,14 +33,14 @@ async fn net_task(
 #[embassy_executor::main]
 async fn main(spawner: embassy_executor::Spawner) {
     let rp = embassy_rp::init(embassy_rp::config::Config::new(
-        embassy_rp::clocks::ClockConfig::system_freq(250_000_000).unwrap(),
+        embassy_rp::clocks::ClockConfig::system_freq(150_000_000).unwrap(),
     ));
     let mut led = gpio::Output::new(rp.PIN_25, gpio::Level::Low);
     led.set_high();
     let mut rng = embassy_rp::clocks::RoscRng;
 
     let mut spi_cfg = embassy_rp::spi::Config::default();
-    spi_cfg.frequency = 40_000_000;
+    spi_cfg.frequency = 72_000_000;
     let (miso, mosi, clk) = (rp.PIN_16, rp.PIN_19, rp.PIN_18);
     let spi = embassy_rp::spi::Spi::new(rp.SPI0, clk, mosi, miso, rp.DMA_CH0, rp.DMA_CH1, spi_cfg);
     let cs = gpio::Output::new(rp.PIN_17, gpio::Level::High);
