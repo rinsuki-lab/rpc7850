@@ -114,6 +114,8 @@ async fn read_loop(mut socket: embassy_net::tcp::TcpSocket<'_>) {
             break;
         }
     }
+    socket.abort();
+    socket.flush().await.unwrap();
 }
 
 #[panic_handler]
