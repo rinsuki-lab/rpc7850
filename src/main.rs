@@ -3,8 +3,16 @@
 
 mod config; // please make your one by copy config.example.rs and modify it
 
+use core::sync::atomic::AtomicU8;
+
 use embassy_rp::gpio;
+use embassy_usb::control;
 use static_cell::StaticCell;
+use usbd_hid::descriptor::SerializedDescriptor as _;
+
+embassy_rp::bind_interrupts!(struct Irqs {
+    USBCTRL_IRQ => embassy_rp::usb::InterruptHandler<embassy_rp::peripherals::USB>;
+});
 
 #[embassy_executor::task]
 async fn ethernet_task(
@@ -29,6 +37,8 @@ async fn net_task(
 ) -> ! {
     runner.run().await
 }
+
+static HID_PROTOCOL_MODE: AtomicU8 = AtomicU8::new(usbd_hid::hid_class::HidProtocolMode::Boot as u8);
 
 #[embassy_executor::main]
 async fn main(spawner: embassy_executor::Spawner) {
@@ -83,22 +93,61 @@ async fn main(spawner: embassy_executor::Spawner) {
     );
     spawner.spawn(net_task(runner)).unwrap();
 
+    let driver = embassy_rp::usb::Driver::new(rp.USB, Irqs);
+    // https://github.com/obdev/v-usb/blob/7a28fdc685952412dad2b8842429127bc1cf9fa7/usbdrv/USB-IDs-for-free.txt
+    let mut config = embassy_usb::Config::new(0x16c0, 0x05df);
+    // https://www.usb.org/defined-class-codes#anchor_BaseClass00h
+    config.composite_with_iads = false;
+    config.device_class = 0;
+    config.device_sub_class = 0;
+    config.device_protocol = 0;
+
+    let mut hid_state = embassy_usb::class::hid::State::new();
+    let mut config_descriptor = [0; 256];
+    let mut bos_descriptor = [0; 256];
+    let mut msos_descriptor = [0; 256];
+    let mut control_buf = [0; 64];
+    let mut keyboard_handler = KeyboardRequestHandler {};
+    let mut builder = embassy_usb::Builder::new(driver, config, &mut config_descriptor, &mut bos_descriptor, &mut msos_descriptor, &mut control_buf);
+    let config = embassy_usb::class::hid::Config {
+        report_descriptor: usbd_hid::descriptor::KeyboardReport::desc(),
+        request_handler: Some(&mut keyboard_handler),
+        poll_ms: 17,
+        max_packet_size: 8,
+        hid_boot_protocol: embassy_usb::class::hid::HidBootProtocol::Keyboard,
+        hid_subclass: embassy_usb::class::hid::HidSubclass::Boot,
+    };
+    let mut hid = embassy_usb::class::hid::HidReaderWriter::<_, 1, 8>::new(&mut builder, &mut hid_state, config);
+    let mut usb = builder.build();
+    let usb_fut = usb.run();
+
     let mut rx_buffer = [0; 4096];
     let mut tx_buffer = [0; 4096];
-    loop {
-        let mut socket = embassy_net::tcp::TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
-        socket.set_timeout(Some(embassy_time::Duration::from_secs(10)));
-        led.set_low();
-        if let Err(e) = socket.accept(5151).await {
-            continue;
-        }
-        led.set_high();
+    let (mut hid_reader, mut hid_writer) = hid.split();
 
-        read_loop(socket).await;
-    }
+    let tcp_fut = async {
+        loop {
+            let mut socket = embassy_net::tcp::TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
+            socket.set_timeout(Some(embassy_time::Duration::from_secs(10)));
+            led.set_low();
+            if let Err(e) = socket.accept(5151).await {
+                continue;
+            }
+            led.set_high();
+
+            read_loop(socket, &mut hid_writer).await;
+        }
+    };
+
+    let mut out_report_handler = OutReportHandler {};
+    let out_fut = async {
+        hid_reader.run(false, &mut out_report_handler).await;
+    };
+
+    embassy_futures::join::join3(usb_fut, tcp_fut, out_fut).await;
 }
 
-async fn read_loop(mut socket: embassy_net::tcp::TcpSocket<'_>) {
+async fn read_loop<'d, D: embassy_usb::driver::Driver<'d>>(mut socket: embassy_net::tcp::TcpSocket<'_>, hid: &mut embassy_usb::class::hid::HidWriter<'d, D, 8>) {
     let mut buf: [u8; 16] = [0; 16];
     loop {
         let mut i = 0;
@@ -107,6 +156,24 @@ async fn read_loop(mut socket: embassy_net::tcp::TcpSocket<'_>) {
                 Ok(0) => return, // EOF
                 Ok(n) => i += n,
                 Err(_) => return, // error
+            }
+        }
+        if buf == *b"write_some_texts" {
+            let mut buf: [u8; 1] = [0; 1];
+            loop {
+                match socket.read(&mut buf).await {
+                    Ok(0) => break, // EOF
+                    Ok(_) => {
+                        let charcode = match buf[0] {
+                            b'a'..=b'z' => buf[0] - b'a' + 0x04,
+                            b'\n' => 0x28,
+                            _ => 0,
+                        };
+                        hid.write(&[0, 0, charcode, 0, 0, 0, 0, 0]).await.unwrap();
+                        hid.write(&[0; 8]).await.unwrap();
+                    },
+                    Err(_) => break, // error
+                }
             }
         }
         if buf == *b"reset_to_usbboot" {
@@ -122,4 +189,22 @@ async fn read_loop(mut socket: embassy_net::tcp::TcpSocket<'_>) {
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     embassy_rp::rom_data::reset_to_usb_boot(0, 0);
     loop {}
+}
+
+struct OutReportHandler {}
+impl embassy_usb::class::hid::RequestHandler for OutReportHandler {}
+
+struct KeyboardRequestHandler {}
+impl embassy_usb::class::hid::RequestHandler for KeyboardRequestHandler {
+    fn get_protocol(&self) -> embassy_usb::class::hid::HidProtocolMode {
+        match HID_PROTOCOL_MODE.load(core::sync::atomic::Ordering::SeqCst) {
+            x if x == usbd_hid::hid_class::HidProtocolMode::Report as u8 => embassy_usb::class::hid::HidProtocolMode::Report,
+            _ => embassy_usb::class::hid::HidProtocolMode::Boot,
+        }
+    }
+
+    fn set_protocol(&mut self, protocol: embassy_usb::class::hid::HidProtocolMode) -> control::OutResponse {
+        HID_PROTOCOL_MODE.store(protocol as u8, core::sync::atomic::Ordering::SeqCst);
+        control::OutResponse::Accepted
+    }
 }
