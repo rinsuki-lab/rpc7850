@@ -197,6 +197,7 @@ async fn read_loop<'d, D: embassy_usb::driver::Driver<'d>>(
         } else if buf[0..8] == *b"rawhidgc" {
             hid_gc.write(&buf[8..16]).await.unwrap();
             socket.write(b"ack\x00").await.unwrap();
+            socket.flush().await.unwrap();
         } else if buf == *b"reset_to_usbboot" {
             embassy_rp::rom_data::reset_to_usb_boot(0, 0);
             break;
