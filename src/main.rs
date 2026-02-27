@@ -95,8 +95,10 @@ async fn main(spawner: embassy_executor::Spawner) {
     spawner.spawn(net_task(runner)).unwrap();
 
     let driver = embassy_rp::usb::Driver::new(rp.USB, Irqs);
-    // https://github.com/obdev/v-usb/blob/7a28fdc685952412dad2b8842429127bc1cf9fa7/usbdrv/USB-IDs-for-free.txt
-    let mut config = embassy_usb::Config::new(0x16c0, 0x05df);
+    let mut config = embassy_usb::Config::new(config::USB_VID, config::USB_PID);
+    config.bcd_usb = embassy_usb::UsbVersion::Two;
+    config.product = config::USB_PRODUCT;
+    config.manufacturer = config::USB_MANUFACTURER;
     // https://www.usb.org/defined-class-codes#anchor_BaseClass00h
     config.composite_with_iads = false;
     config.device_class = 0;
