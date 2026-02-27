@@ -175,8 +175,10 @@ async fn read_loop<'d, D: embassy_usb::driver::Driver<'d>>(mut socket: embassy_n
                     Err(_) => break, // error
                 }
             }
-        }
-        if buf == *b"reset_to_usbboot" {
+        } else if buf[0..8] == *b"rawhidkb" {
+            hid.write(&buf[8..16]).await.unwrap();
+            socket.write(b"ack\x00").await.unwrap();
+        } else if buf == *b"reset_to_usbboot" {
             embassy_rp::rom_data::reset_to_usb_boot(0, 0);
             break;
         }
