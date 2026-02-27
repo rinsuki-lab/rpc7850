@@ -2,6 +2,7 @@
 #![no_main]
 
 mod config; // please make your one by copy config.example.rs and modify it
+mod hid;
 
 use core::sync::atomic::AtomicU8;
 
@@ -102,13 +103,23 @@ async fn main(spawner: embassy_executor::Spawner) {
     config.device_sub_class = 0;
     config.device_protocol = 0;
 
-    let mut hid_state = embassy_usb::class::hid::State::new();
+    let mut hid_state_kb = embassy_usb::class::hid::State::new();
+    let mut hid_state_gc = embassy_usb::class::hid::State::new();
     let mut config_descriptor = [0; 256];
     let mut bos_descriptor = [0; 256];
     let mut msos_descriptor = [0; 256];
     let mut control_buf = [0; 64];
     let mut keyboard_handler = KeyboardRequestHandler {};
     let mut builder = embassy_usb::Builder::new(driver, config, &mut config_descriptor, &mut bos_descriptor, &mut msos_descriptor, &mut control_buf);
+    let config = embassy_usb::class::hid::Config {
+        report_descriptor: hid::controller::CONTROLLER_REPORT_DESCRIPTOR,
+        request_handler: None,
+        poll_ms: 17,
+        max_packet_size: 64,
+        hid_boot_protocol: embassy_usb::class::hid::HidBootProtocol::None,
+        hid_subclass: embassy_usb::class::hid::HidSubclass::No,
+    };
+    let hid_gc = embassy_usb::class::hid::HidReaderWriter::<_, 2, 8>::new(&mut builder, &mut hid_state_gc, config);
     let config = embassy_usb::class::hid::Config {
         report_descriptor: usbd_hid::descriptor::KeyboardReport::desc(),
         request_handler: Some(&mut keyboard_handler),
@@ -117,13 +128,14 @@ async fn main(spawner: embassy_executor::Spawner) {
         hid_boot_protocol: embassy_usb::class::hid::HidBootProtocol::Keyboard,
         hid_subclass: embassy_usb::class::hid::HidSubclass::Boot,
     };
-    let mut hid = embassy_usb::class::hid::HidReaderWriter::<_, 1, 8>::new(&mut builder, &mut hid_state, config);
+    let hid_kb = embassy_usb::class::hid::HidReaderWriter::<_, 1, 8>::new(&mut builder, &mut hid_state_kb, config);
     let mut usb = builder.build();
     let usb_fut = usb.run();
 
     let mut rx_buffer = [0; 4096];
     let mut tx_buffer = [0; 4096];
-    let (mut hid_reader, mut hid_writer) = hid.split();
+    let (mut hid_kb_reader, mut hid_kb_writer) = hid_kb.split();
+    let (_hid_gc_reader, mut hid_gc_writer) = hid_gc.split();
 
     let tcp_fut = async {
         loop {
@@ -135,19 +147,23 @@ async fn main(spawner: embassy_executor::Spawner) {
             }
             led.set_high();
 
-            read_loop(socket, &mut hid_writer).await;
+            read_loop(socket, &mut hid_kb_writer, &mut hid_gc_writer).await;
         }
     };
 
     let mut out_report_handler = OutReportHandler {};
     let out_fut = async {
-        hid_reader.run(false, &mut out_report_handler).await;
+        hid_kb_reader.run(false, &mut out_report_handler).await;
     };
 
     embassy_futures::join::join3(usb_fut, tcp_fut, out_fut).await;
 }
 
-async fn read_loop<'d, D: embassy_usb::driver::Driver<'d>>(mut socket: embassy_net::tcp::TcpSocket<'_>, hid: &mut embassy_usb::class::hid::HidWriter<'d, D, 8>) {
+async fn read_loop<'d, D: embassy_usb::driver::Driver<'d>>(
+    mut socket: embassy_net::tcp::TcpSocket<'_>,
+    hid_kb: &mut embassy_usb::class::hid::HidWriter<'d, D, 8>,
+    hid_gc: &mut embassy_usb::class::hid::HidWriter<'d, D, 8>
+) {
     let mut buf: [u8; 16] = [0; 16];
     loop {
         let mut i = 0;
@@ -169,14 +185,17 @@ async fn read_loop<'d, D: embassy_usb::driver::Driver<'d>>(mut socket: embassy_n
                             b'\n' => 0x28,
                             _ => 0,
                         };
-                        hid.write(&[0, 0, charcode, 0, 0, 0, 0, 0]).await.unwrap();
-                        hid.write(&[0; 8]).await.unwrap();
+                        hid_kb.write(&[0, 0, charcode, 0, 0, 0, 0, 0]).await.unwrap();
+                        hid_kb.write(&[0; 8]).await.unwrap();
                     },
                     Err(_) => break, // error
                 }
             }
         } else if buf[0..8] == *b"rawhidkb" {
-            hid.write(&buf[8..16]).await.unwrap();
+            hid_kb.write(&buf[8..16]).await.unwrap();
+            socket.write(b"ack\x00").await.unwrap();
+        } else if buf[0..8] == *b"rawhidgc" {
+            hid_gc.write(&buf[8..16]).await.unwrap();
             socket.write(b"ack\x00").await.unwrap();
         } else if buf == *b"reset_to_usbboot" {
             embassy_rp::rom_data::reset_to_usb_boot(0, 0);
